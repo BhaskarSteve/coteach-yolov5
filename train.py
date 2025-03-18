@@ -539,20 +539,34 @@ def train(hyp, opt, device, callbacks):
                 
                 # Co-teaching: each model learns from the other's small-loss samples
                 if batch_size > 1:  # Co-teaching requires at least 2 samples
+                    # Get actual batch size from the per_img_loss tensors (important for last batch which might be smaller)
+                    actual_batch_size1 = per_img_loss1.size(0)
+                    actual_batch_size2 = per_img_loss2.size(0)
+                    
                     # Get indices of samples with small losses from each model
                     idx1_sorted = sorted_indices1.tolist()  # From model 1's perspective
                     idx2_sorted = sorted_indices2.tolist()  # From model 2's perspective
                     
-                    # Select top num_remember samples with smallest losses
-                    idx1_update = idx2_sorted[:num_remember]  # Samples for updating model 1 (from model 2's view)
-                    idx2_update = idx1_sorted[:num_remember]  # Samples for updating model 2 (from model 1's view)
+                    # Calculate actual number to remember (proportional to actual batch size)
+                    actual_num_remember1 = min(num_remember, actual_batch_size1)
+                    actual_num_remember2 = min(num_remember, actual_batch_size2)
                     
-                    # Create masks for backpropagation
-                    mask1 = torch.zeros(batch_size, device=device, dtype=torch.bool)
-                    mask2 = torch.zeros(batch_size, device=device, dtype=torch.bool)
+                    # Select top samples with smallest losses
+                    idx1_update = idx2_sorted[:actual_num_remember1]  # Samples for updating model 1 (from model 2's view)
+                    idx2_update = idx1_sorted[:actual_num_remember2]  # Samples for updating model 2 (from model 1's view)
                     
-                    mask1[idx1_update] = True
-                    mask2[idx2_update] = True
+                    # Create masks for backpropagation (using actual batch sizes)
+                    mask1 = torch.zeros(actual_batch_size1, device=device, dtype=torch.bool)
+                    mask2 = torch.zeros(actual_batch_size2, device=device, dtype=torch.bool)
+                    
+                    # Only set valid indices to True
+                    for idx in idx1_update:
+                        if idx < actual_batch_size1:  # Ensure index is valid
+                            mask1[idx] = True
+                    
+                    for idx in idx2_update:
+                        if idx < actual_batch_size2:  # Ensure index is valid
+                            mask2[idx] = True
                     
                     # Only compute loss for selected samples
                     filtered_loss1 = (per_img_loss1 * mask1.float()).sum() / max(mask1.float().sum(), 1)
@@ -676,8 +690,8 @@ def train(hyp, opt, device, callbacks):
                     fi2 = fitness(np.array(results2).reshape(1, -1))
                     
                     # Convert fitness values to scalar floats for logging
-                    fi1_float = float(fi1)
-                    fi2_float = float(fi2)
+                    fi1_float = float(fi1.item() if hasattr(fi1, 'item') else fi1)
+                    fi2_float = float(fi2.item() if hasattr(fi2, 'item') else fi2)
                     
                     if fi1_float >= fi2_float:
                         results, maps = results1, maps1

@@ -890,7 +890,7 @@ def parse_opt(known=False):
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
-    parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
+    parser.add_argument("--batch-size", type=int, default=8, help="total batch size for all GPUs, -1 for autobatch")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
     parser.add_argument("--rect", action="store_true", help="rectangular training")
     parser.add_argument("--resume", nargs="?", const=True, default=False, help="resume most recent training")
@@ -901,7 +901,7 @@ def parse_opt(known=False):
     # Co-teaching parameters
     parser.add_argument("--coteaching", action="store_true", help="enable co-teaching algorithm")
     parser.add_argument("--forget-rate", type=float, default=0.2, help="initial forget rate for co-teaching")
-    parser.add_argument("--num-gradual", type=int, default=10, help="number of epochs for gradual increase of forget rate")
+    parser.add_argument("--num-gradual", type=int, default=100, help="number of epochs for gradual increase of forget rate")
     parser.add_argument("--init-noise", type=float, default=0.005, help="noise factor for initializing the second model (lower values = more similar models)")
     parser.add_argument("--evolve", type=int, nargs="?", const=300, help="evolve hyperparameters for x generations")
     parser.add_argument(

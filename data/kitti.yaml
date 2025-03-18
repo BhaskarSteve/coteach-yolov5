@@ -1,0 +1,13 @@
+path: /home/cdq2kor/Desktop/code/datasets/kitti # Give path of the dataset 
+train: images/train # Give relative path of the train images
+val: images/val # Give relative path of the validation images
+
+nc: 8
+names: 
+    0: 'Car'
+    1: 'Cyclist'
+    2: 'Van'
+    3: 'Person_sitting'
+    4: 'Pedestrian'
+    5: 'Truck'
+    6: 'Tram'

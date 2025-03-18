@@ -1,0 +1,16 @@
+path: /home/cdq2kor/Desktop/code/datasets/bdd # Give path of the dataset 
+train: images/train # Give relative path of the train images
+val: images/val # Give relative path of the validation images
+
+nc: 13
+names: 
+    0: 'bike'
+    1: 'bus'
+    2: 'car'
+    3: 'motorcycle'
+    4: 'person'
+    5: 'motorcycle rider'
+    6: 'traffic light'
+    7: 'traffic sign'
+    8: 'train'
+    9: 'truck'

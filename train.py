@@ -430,7 +430,16 @@ def train(hyp, opt, device, callbacks):
         rate_schedule = np.ones(epochs) * forget_rate
         # Gradually increase the forget rate
         rate_schedule[:num_gradual] = np.linspace(0, forget_rate, num_gradual)
-        LOGGER.info(f"Co-teaching enabled with initial forget rate {forget_rate} and gradual increase over {num_gradual} epochs")
+        
+        if opt.stochastic:
+            # Stochastic co-teaching uses a beta distribution to sample the threshold
+            # This makes it adaptive to unknown noise rates
+            alpha = opt.stocot_alpha
+            beta = opt.stocot_beta
+            LOGGER.info(f"Stochastic co-teaching enabled with Beta({alpha}, {beta}) distribution")
+            LOGGER.info(f"This approach adapts to unknown noise rates and does not require setting a fixed forget rate")
+        else:
+            LOGGER.info(f"Co-teaching enabled with initial forget rate {forget_rate} and gradual increase over {num_gradual} epochs")
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\n"
@@ -442,11 +451,19 @@ def train(hyp, opt, device, callbacks):
         callbacks.run("on_train_epoch_start")
         model.train()
         
-        # Print current forget rate if co-teaching is enabled
+        # Print current co-teaching info
         if opt.coteaching:
-            current_forget_rate = rate_schedule[epoch]
-            remember_rate = 1 - current_forget_rate
-            LOGGER.info(f"Co-teaching: epoch {epoch}, forget rate {current_forget_rate:.4f}, remember rate {remember_rate:.4f}")
+            if opt.stochastic:
+                # Reset statistics collection for this epoch
+                opt.epoch_thresholds1 = []
+                opt.epoch_thresholds2 = []
+                opt.epoch_keep_rates1 = []
+                opt.epoch_keep_rates2 = []
+                LOGGER.info(f"Stochastic co-teaching: epoch {epoch}, using Beta({opt.stocot_alpha}, {opt.stocot_beta}) distribution")
+            else:
+                current_forget_rate = rate_schedule[epoch]
+                remember_rate = 1 - current_forget_rate
+                LOGGER.info(f"Co-teaching: epoch {epoch}, forget rate {current_forget_rate:.4f}, remember rate {remember_rate:.4f}")
 
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
@@ -515,10 +532,13 @@ def train(hyp, opt, device, callbacks):
                         ema1.update(model1)
                     last_opt_step = ni
             else:  # Co-teaching training
-                # Calculate current forget rate based on epoch schedule
-                current_forget_rate = rate_schedule[epoch]
-                remember_rate = 1 - current_forget_rate
-                num_remember = int(remember_rate * batch_size)
+                # Calculate current forget rate based on epoch schedule - only for standard co-teaching
+                if not opt.stochastic:
+                    current_forget_rate = rate_schedule[epoch]
+                    remember_rate = 1 - current_forget_rate
+                    num_remember = int(remember_rate * batch_size)
+                # For stochastic co-teaching, we don't need to calculate num_remember as we'll
+                # use the beta distribution to dynamically determine which samples to keep
                 
                 # Forward pass for both models
                 with torch.amp.autocast('cuda'):
@@ -543,17 +563,53 @@ def train(hyp, opt, device, callbacks):
                     actual_batch_size1 = per_img_loss1.size(0)
                     actual_batch_size2 = per_img_loss2.size(0)
                     
-                    # Get indices of samples with small losses from each model
-                    idx1_sorted = sorted_indices1.tolist()  # From model 1's perspective
-                    idx2_sorted = sorted_indices2.tolist()  # From model 2's perspective
-                    
-                    # Calculate actual number to remember (proportional to actual batch size)
-                    actual_num_remember1 = min(num_remember, actual_batch_size1)
-                    actual_num_remember2 = min(num_remember, actual_batch_size2)
-                    
-                    # Select top samples with smallest losses
-                    idx1_update = idx2_sorted[:actual_num_remember1]  # Samples for updating model 1 (from model 2's view)
-                    idx2_update = idx1_sorted[:actual_num_remember2]  # Samples for updating model 2 (from model 1's view)
+                    # Determine selection strategy based on co-teaching type
+                    if opt.stochastic:
+                        # Stochastic co-teaching approach - sample threshold from beta distribution
+                        # Sample random threshold from beta distribution
+                        threshold1 = np.random.beta(opt.stocot_alpha, opt.stocot_beta)
+                        threshold2 = np.random.beta(opt.stocot_alpha, opt.stocot_beta)
+                        
+                        # Get predicted probabilities for the "ground truth" class
+                        # We'll use the confidence scores as a proxy for predicted probabilities
+                        pred_probs1 = torch.sigmoid(pred1[0])
+                        pred_probs2 = torch.sigmoid(pred2[0])
+                        
+                        # Create masks based on probability threshold
+                        idx1_update = []
+                        for i in range(actual_batch_size1):
+                            # If probability exceeds threshold, keep the sample
+                            if torch.max(pred_probs2[i]) >= threshold1:
+                                idx1_update.append(i)
+                                
+                        idx2_update = []
+                        for i in range(actual_batch_size2):
+                            # If probability exceeds threshold, keep the sample
+                            if torch.max(pred_probs1[i]) >= threshold2:
+                                idx2_update.append(i)
+                        
+                        # Calculate the percentage of samples kept in this batch
+                        keep_rate1 = len(idx1_update) / actual_batch_size1 if actual_batch_size1 > 0 else 0
+                        keep_rate2 = len(idx2_update) / actual_batch_size2 if actual_batch_size2 > 0 else 0
+                        
+                        # Store statistics for this batch (without logging to console)
+                        opt.epoch_thresholds1.append(threshold1)
+                        opt.epoch_thresholds2.append(threshold2)
+                        opt.epoch_keep_rates1.append(keep_rate1)
+                        opt.epoch_keep_rates2.append(keep_rate2)
+                    else:
+                        # Original co-teaching approach - fixed remember rate
+                        # Get indices of samples with small losses from each model
+                        idx1_sorted = sorted_indices1.tolist()  # From model 1's perspective
+                        idx2_sorted = sorted_indices2.tolist()  # From model 2's perspective
+                        
+                        # Calculate actual number to remember (proportional to actual batch size)
+                        actual_num_remember1 = min(num_remember, actual_batch_size1)
+                        actual_num_remember2 = min(num_remember, actual_batch_size2)
+                        
+                        # Select top samples with smallest losses
+                        idx1_update = idx2_sorted[:actual_num_remember1]  # Samples for updating model 1 (from model 2's view)
+                        idx2_update = idx1_sorted[:actual_num_remember2]  # Samples for updating model 2 (from model 1's view)
                     
                     # Create masks for backpropagation (using actual batch sizes)
                     mask1 = torch.zeros(actual_batch_size1, device=device, dtype=torch.bool)
@@ -699,6 +755,19 @@ def train(hyp, opt, device, callbacks):
                     else:
                         results, maps = results2, maps2
                         LOGGER.info(f"Model 2 performed better: {fi2_float:.4f} vs {fi1_float:.4f}")
+                    
+                    # Display stochastic co-teaching statistics for this epoch if enabled
+                    if opt.stochastic and hasattr(opt, 'epoch_thresholds1') and len(opt.epoch_thresholds1) > 0:
+                        # Calculate averages
+                        avg_threshold1 = sum(opt.epoch_thresholds1) / len(opt.epoch_thresholds1)
+                        avg_threshold2 = sum(opt.epoch_thresholds2) / len(opt.epoch_thresholds2) 
+                        avg_keep_rate1 = sum(opt.epoch_keep_rates1) / len(opt.epoch_keep_rates1)
+                        avg_keep_rate2 = sum(opt.epoch_keep_rates2) / len(opt.epoch_keep_rates2)
+                        
+                        LOGGER.info(f"\nStochastic co-teaching summary for epoch {epoch}:")
+                        LOGGER.info(f"  Beta distribution: α={opt.stocot_alpha}, β={opt.stocot_beta}")
+                        LOGGER.info(f"  Average thresholds: {avg_threshold1:.3f}/{avg_threshold2:.3f}")
+                        LOGGER.info(f"  Average keep rates: {avg_keep_rate1:.2f}/{avg_keep_rate2:.2f} (equivalent to remember rates)")
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -914,9 +983,13 @@ def parse_opt(known=False):
     parser.add_argument("--noplots", action="store_true", help="save no plot files")
     # Co-teaching parameters
     parser.add_argument("--coteaching", action="store_true", help="enable co-teaching algorithm")
+    parser.add_argument("--stochastic", action="store_true", help="use stochastic co-teaching (doesn't require known noise rate)")
     parser.add_argument("--forget-rate", type=float, default=0.2, help="initial forget rate for co-teaching")
     parser.add_argument("--num-gradual", type=int, default=100, help="number of epochs for gradual increase of forget rate")
     parser.add_argument("--init-noise", type=float, default=0.005, help="noise factor for initializing the second model (lower values = more similar models)")
+    parser.add_argument("--stocot-alpha", type=float, default=32, help="alpha parameter for beta distribution in stochastic co-teaching")
+    parser.add_argument("--stocot-beta", type=float, default=2, help="beta parameter for beta distribution in stochastic co-teaching")
+    
     parser.add_argument("--evolve", type=int, nargs="?", const=300, help="evolve hyperparameters for x generations")
     parser.add_argument(
         "--evolve_population", type=str, default=ROOT / "data/hyps", help="location for loading population"

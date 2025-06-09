@@ -352,7 +352,7 @@ def train(hyp, opt, device, callbacks):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)  # init loss class
     callbacks.run("on_train_start")
@@ -409,7 +409,7 @@ def train(hyp, opt, device, callbacks):
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
-            with torch.cuda.amp.autocast(amp):
+            with torch.amp.autocast('cuda', enabled=amp):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
@@ -564,9 +564,9 @@ def parse_opt(known=False):
         - Tutorial: https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", type=str, default=ROOT / "yolov5s.pt", help="initial weights path")
-    parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
+    parser.add_argument("--weights", type=str, default=ROOT / "", help="initial weights path")
+    parser.add_argument("--cfg", type=str, default="yolov5m.yaml", help="model.yaml path")
+    parser.add_argument("--data", type=str, default=ROOT / "data/kitti.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")

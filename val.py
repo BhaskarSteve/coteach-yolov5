@@ -342,7 +342,9 @@ def run(
 
         # Loss
         if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+            # Unpack four return values from ComputeLoss.__call__, but only use loss_items
+            _, loss_items, _, _ = compute_loss(train_out, targets)
+            loss += loss_items  # box, obj, cls
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels

@@ -1,0 +1,10 @@
+path: ../datasets/largetl
+train:
+  - images/train
+val:
+  - images/val
+test:
+  - images/val
+
+names:
+  0: traffic_light

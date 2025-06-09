@@ -1,0 +1,19 @@
+path: ../datasets/bdd # Give path of the dataset 
+train: images/train # Give relative path of the train images
+val: images/val # Give relative path of the validation images
+
+nc: 13
+names: 
+    0: 'bicycle'
+    1: 'bus'
+    2: 'car'
+    3: 'motorcycle'
+    4: 'other person'
+    5: 'other vehicle'
+    6: 'pedestrian'
+    7: 'rider'
+    8: 'traffic light'
+    9: 'traffic sign'
+    10: 'trailer'
+    11: 'train'
+    12: 'truck'

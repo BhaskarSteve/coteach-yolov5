@@ -206,21 +206,43 @@ def train(hyp, opt, device, callbacks):
     names = {0: "item"} if single_cls and len(data_dict["names"]) != 1 else data_dict["names"]  # class names
     is_coco = isinstance(val_path, str) and val_path.endswith("coco/val2017.txt")  # COCO dataset
 
-    # Model
+    # Model(s)
     check_suffix(weights, ".pt")  # check weights
     pretrained = weights.endswith(".pt")
+    
+    # Create first model
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        model1 = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
         csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
-        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
-        model.load_state_dict(csd, strict=False)  # load
-        LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
+        csd = intersect_dicts(csd, model1.state_dict(), exclude=exclude)  # intersect
+        model1.load_state_dict(csd, strict=False)  # load
+        LOGGER.info(f"Transferred {len(csd)}/{len(model1.state_dict())} items from {weights}")  # report
+        
+        # Create second model for co-teaching
+        if opt.coteaching:
+            model2 = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+            model2.load_state_dict(csd, strict=False)  # load same weights initially
+            # Slightly perturb the weights of model2 to ensure different initialization
+            for param in model2.parameters():
+                param.data = param.data + opt.init_noise * torch.randn_like(param.data)
+            LOGGER.info(f"Created second model with weights perturbed by noise factor {opt.init_noise} for co-teaching")
+        else:
+            model2 = None
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        model1 = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        if opt.coteaching:
+            model2 = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create second model
+            # No need to add noise since each model is already randomly initialized with different weights
+            LOGGER.info(f"Created second model with different random initialization for co-teaching")
+        else:
+            model2 = None
+    
+    # For compatibility with existing code
+    model = model1
     amp = check_amp(model)  # check AMP
 
     # Freeze
@@ -241,13 +263,22 @@ def train(hyp, opt, device, callbacks):
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
 
-    # Optimizer
+    # Optimizer(s)
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
-    optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+    optimizer1 = smart_optimizer(model1, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+    
+    # For compatibility with existing code
+    optimizer = optimizer1
+    
+    if opt.coteaching:
+        # Create second optimizer for co-teaching
+        optimizer2 = smart_optimizer(model2, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+    else:
+        optimizer2 = None
 
-    # Scheduler
+    # Scheduler(s)
     if opt.cos_lr:
         lf = one_cycle(1, hyp["lrf"], epochs)  # cosine 1->hyp['lrf']
     else:
@@ -256,16 +287,38 @@ def train(hyp, opt, device, callbacks):
             """Linear learning rate scheduler function with decay calculated by epoch proportion."""
             return (1 - x / epochs) * (1.0 - hyp["lrf"]) + hyp["lrf"]  # linear
 
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+    scheduler1 = lr_scheduler.LambdaLR(optimizer1, lr_lambda=lf)
+    
+    # For compatibility with existing code
+    scheduler = scheduler1
+    
+    if opt.coteaching:
+        # Create second scheduler for co-teaching
+        scheduler2 = lr_scheduler.LambdaLR(optimizer2, lr_lambda=lf)
+    else:
+        scheduler2 = None
 
-    # EMA
-    ema = ModelEMA(model) if RANK in {-1, 0} else None
+    # EMA(s)
+    ema1 = ModelEMA(model1) if RANK in {-1, 0} else None
+    
+    # For compatibility with existing code
+    ema = ema1
+    
+    if opt.coteaching and RANK in {-1, 0}:
+        # Create second EMA for co-teaching
+        ema2 = ModelEMA(model2)
+    else:
+        ema2 = None
 
     # Resume
     best_fitness, start_epoch = 0.0, 0
     if pretrained:
         if resume:
-            best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
+            best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer1, ema1, weights, epochs, resume)
+            if opt.coteaching:
+                # Also set up second model's resume state
+                for g in optimizer2.param_groups:
+                    g['lr'] = optimizer1.param_groups[0]['lr']
         del ckpt, csd
 
     # DP mode
@@ -342,6 +395,13 @@ def train(hyp, opt, device, callbacks):
     model.hyp = hyp  # attach hyperparameters to model
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
+    
+    # Also attach attributes to model2 if using co-teaching
+    if opt.coteaching and model2 is not None:
+        model2.nc = nc  # attach number of classes to model2
+        model2.hyp = hyp  # attach hyperparameters to model2
+        model2.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+        model2.names = names
 
     # Start training
     t0 = time.time()
@@ -352,9 +412,34 @@ def train(hyp, opt, device, callbacks):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scaler = torch.amp.GradScaler('cuda')
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
+    compute_loss1 = ComputeLoss(model1)  # init loss class for first model
+    if opt.coteaching:
+        compute_loss2 = ComputeLoss(model2)  # init loss class for second model
+    else:
+        compute_loss2 = None
+        
+    # For compatibility with existing code
+    compute_loss = compute_loss1
+    
+    # Setup co-teaching parameters if enabled
+    if opt.coteaching:
+        forget_rate = opt.forget_rate
+        num_gradual = opt.num_gradual
+        rate_schedule = np.ones(epochs) * forget_rate
+        # Gradually increase the forget rate
+        rate_schedule[:num_gradual] = np.linspace(0, forget_rate, num_gradual)
+        
+        if opt.stochastic:
+            # Stochastic co-teaching uses a beta distribution to sample the threshold
+            # This makes it adaptive to unknown noise rates
+            alpha = opt.stocot_alpha
+            beta = opt.stocot_beta
+            LOGGER.info(f"Stochastic co-teaching enabled with Beta({alpha}, {beta}) distribution")
+            LOGGER.info(f"This approach adapts to unknown noise rates and does not require setting a fixed forget rate")
+        else:
+            LOGGER.info(f"Co-teaching enabled with initial forget rate {forget_rate} and gradual increase over {num_gradual} epochs")
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\n"
@@ -365,6 +450,20 @@ def train(hyp, opt, device, callbacks):
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run("on_train_epoch_start")
         model.train()
+        
+        # Print current co-teaching info
+        if opt.coteaching:
+            if opt.stochastic:
+                # Reset statistics collection for this epoch
+                opt.epoch_thresholds1 = []
+                opt.epoch_thresholds2 = []
+                opt.epoch_keep_rates1 = []
+                opt.epoch_keep_rates2 = []
+                LOGGER.info(f"Stochastic co-teaching: epoch {epoch}, using Beta({opt.stocot_alpha}, {opt.stocot_beta}) distribution")
+            else:
+                current_forget_rate = rate_schedule[epoch]
+                remember_rate = 1 - current_forget_rate
+                LOGGER.info(f"Co-teaching: epoch {epoch}, forget rate {current_forget_rate:.4f}, remember rate {remember_rate:.4f}")
 
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
@@ -409,27 +508,161 @@ def train(hyp, opt, device, callbacks):
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
-            with torch.cuda.amp.autocast(amp):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                if opt.quad:
-                    loss *= 4.0
+            if not opt.coteaching:  # Standard training
+                with torch.amp.autocast('cuda'):
+                    pred = model1(imgs)  # forward
+                    # Unpack the four return values from ComputeLoss.__call__
+                    loss, loss_items, _, _ = compute_loss1(pred, targets.to(device))  # loss scaled by batch_size
+                    if RANK != -1:
+                        loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                    if opt.quad:
+                        loss *= 4.0
 
-            # Backward
-            scaler.scale(loss).backward()
+                # Backward
+                scaler.scale(loss).backward()
 
-            # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
-            if ni - last_opt_step >= accumulate:
-                scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
-                last_opt_step = ni
+                # Optimize
+                if ni - last_opt_step >= accumulate:
+                    scaler.unscale_(optimizer1)  # unscale gradients
+                    torch.nn.utils.clip_grad_norm_(model1.parameters(), max_norm=10.0)  # clip gradients
+                    scaler.step(optimizer1)  # optimizer.step
+                    scaler.update()
+                    optimizer1.zero_grad()
+                    if ema1:
+                        ema1.update(model1)
+                    last_opt_step = ni
+            else:  # Co-teaching training
+                # Calculate current forget rate based on epoch schedule - only for standard co-teaching
+                if not opt.stochastic:
+                    current_forget_rate = rate_schedule[epoch]
+                    remember_rate = 1 - current_forget_rate
+                    num_remember = int(remember_rate * batch_size)
+                # For stochastic co-teaching, we don't need to calculate num_remember as we'll
+                # use the beta distribution to dynamically determine which samples to keep
+                
+                # Forward pass for both models
+                with torch.amp.autocast('cuda'):
+                    # Model 1 forward
+                    pred1 = model1(imgs)
+                    loss1, loss_items1, per_img_loss1, sorted_indices1 = compute_loss1(pred1, targets.to(device))
+                    
+                    # Model 2 forward
+                    pred2 = model2(imgs)
+                    loss2, loss_items2, per_img_loss2, sorted_indices2 = compute_loss2(pred2, targets.to(device))
+                    
+                    if RANK != -1:
+                        loss1 *= WORLD_SIZE
+                        loss2 *= WORLD_SIZE
+                    if opt.quad:
+                        loss1 *= 4.0
+                        loss2 *= 4.0
+                
+                # Co-teaching: each model learns from the other's small-loss samples
+                if batch_size > 1:  # Co-teaching requires at least 2 samples
+                    # Get actual batch size from the per_img_loss tensors (important for last batch which might be smaller)
+                    actual_batch_size1 = per_img_loss1.size(0)
+                    actual_batch_size2 = per_img_loss2.size(0)
+                    
+                    # Determine selection strategy based on co-teaching type
+                    if opt.stochastic:
+                        # Stochastic co-teaching approach - sample threshold from beta distribution
+                        # Sample random threshold from beta distribution
+                        threshold1 = np.random.beta(opt.stocot_alpha, opt.stocot_beta)
+                        threshold2 = np.random.beta(opt.stocot_alpha, opt.stocot_beta)
+                        
+                        # Get predicted probabilities for the "ground truth" class
+                        # We'll use the confidence scores as a proxy for predicted probabilities
+                        pred_probs1 = torch.sigmoid(pred1[0])
+                        pred_probs2 = torch.sigmoid(pred2[0])
+                        
+                        # Create masks based on probability threshold
+                        idx1_update = []
+                        for i in range(actual_batch_size1):
+                            # If probability exceeds threshold, keep the sample
+                            if torch.max(pred_probs2[i]) >= threshold1:
+                                idx1_update.append(i)
+                                
+                        idx2_update = []
+                        for i in range(actual_batch_size2):
+                            # If probability exceeds threshold, keep the sample
+                            if torch.max(pred_probs1[i]) >= threshold2:
+                                idx2_update.append(i)
+                        
+                        # Calculate the percentage of samples kept in this batch
+                        keep_rate1 = len(idx1_update) / actual_batch_size1 if actual_batch_size1 > 0 else 0
+                        keep_rate2 = len(idx2_update) / actual_batch_size2 if actual_batch_size2 > 0 else 0
+                        
+                        # Store statistics for this batch (without logging to console)
+                        opt.epoch_thresholds1.append(threshold1)
+                        opt.epoch_thresholds2.append(threshold2)
+                        opt.epoch_keep_rates1.append(keep_rate1)
+                        opt.epoch_keep_rates2.append(keep_rate2)
+                    else:
+                        # Original co-teaching approach - fixed remember rate
+                        # Get indices of samples with small losses from each model
+                        idx1_sorted = sorted_indices1.tolist()  # From model 1's perspective
+                        idx2_sorted = sorted_indices2.tolist()  # From model 2's perspective
+                        
+                        # Calculate actual number to remember (proportional to actual batch size)
+                        actual_num_remember1 = min(num_remember, actual_batch_size1)
+                        actual_num_remember2 = min(num_remember, actual_batch_size2)
+                        
+                        # Select top samples with smallest losses
+                        idx1_update = idx2_sorted[:actual_num_remember1]  # Samples for updating model 1 (from model 2's view)
+                        idx2_update = idx1_sorted[:actual_num_remember2]  # Samples for updating model 2 (from model 1's view)
+                    
+                    # Create masks for backpropagation (using actual batch sizes)
+                    mask1 = torch.zeros(actual_batch_size1, device=device, dtype=torch.bool)
+                    mask2 = torch.zeros(actual_batch_size2, device=device, dtype=torch.bool)
+                    
+                    # Only set valid indices to True
+                    for idx in idx1_update:
+                        if idx < actual_batch_size1:  # Ensure index is valid
+                            mask1[idx] = True
+                    
+                    for idx in idx2_update:
+                        if idx < actual_batch_size2:  # Ensure index is valid
+                            mask2[idx] = True
+                    
+                    # Only compute loss for selected samples
+                    filtered_loss1 = (per_img_loss1 * mask1.float()).sum() / max(mask1.float().sum(), 1)
+                    filtered_loss2 = (per_img_loss2 * mask2.float()).sum() / max(mask2.float().sum(), 1)
+                else:
+                    # If batch size is 1, just use the regular loss
+                    filtered_loss1 = loss1
+                    filtered_loss2 = loss2
+                
+                # Backward and optimize for model 1
+                optimizer1.zero_grad()
+                scaler.scale(filtered_loss1).backward()
+                if ni - last_opt_step >= accumulate:
+                    scaler.unscale_(optimizer1)
+                    torch.nn.utils.clip_grad_norm_(model1.parameters(), max_norm=10.0)
+                    scaler.step(optimizer1)
+                    scaler.update()
+                    
+                    # Update model 1's EMA
+                    if ema1:
+                        ema1.update(model1)
+                    
+                    # Backward and optimize for model 2
+                    optimizer2.zero_grad()
+                    # Need a new scaler for the second model
+                    scaler2 = torch.amp.GradScaler('cuda')
+                    scaler2.scale(filtered_loss2).backward()
+                    scaler2.unscale_(optimizer2)
+                    torch.nn.utils.clip_grad_norm_(model2.parameters(), max_norm=10.0)
+                    scaler2.step(optimizer2)
+                    scaler2.update()
+                    
+                    # Update model 2's EMA
+                    if ema2:
+                        ema2.update(model2)
+                    
+                    last_opt_step = ni
+                
+                # For logging purposes, use the average loss items
+                loss_items = (loss_items1 + loss_items2) / 2
 
             # Log
             if RANK in {-1, 0}:
@@ -444,9 +677,18 @@ def train(hyp, opt, device, callbacks):
                     return
             # end batch ------------------------------------------------------------------------------------------------
 
-        # Scheduler
-        lr = [x["lr"] for x in optimizer.param_groups]  # for loggers
-        scheduler.step()
+        # Scheduler(s)
+        if not opt.coteaching:
+            lr = [x["lr"] for x in optimizer1.param_groups]  # for loggers
+            scheduler1.step()
+        else:
+            # Step both schedulers for co-teaching
+            lr1 = [x["lr"] for x in optimizer1.param_groups]
+            lr2 = [x["lr"] for x in optimizer2.param_groups]
+            # Use average of both learning rates for logging
+            lr = [(a + b) / 2 for a, b in zip(lr1, lr2)]
+            scheduler1.step()
+            scheduler2.step()
 
         if RANK in {-1, 0}:
             # mAP
@@ -454,19 +696,78 @@ def train(hyp, opt, device, callbacks):
             ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
-                results, maps, _ = validate.run(
-                    data_dict,
-                    batch_size=batch_size // WORLD_SIZE * 2,
-                    imgsz=imgsz,
-                    half=amp,
-                    model=ema.ema,
-                    single_cls=single_cls,
-                    dataloader=val_loader,
-                    save_dir=save_dir,
-                    plots=False,
-                    callbacks=callbacks,
-                    compute_loss=compute_loss,
-                )
+                if not opt.coteaching:
+                    # Standard validation on single model
+                    results, maps, _ = validate.run(
+                        data_dict,
+                        batch_size=batch_size // WORLD_SIZE * 2,
+                        imgsz=imgsz,
+                        half=amp,
+                        model=ema1.ema,
+                        single_cls=single_cls,
+                        dataloader=val_loader,
+                        save_dir=save_dir,
+                        plots=False,
+                        callbacks=callbacks,
+                        compute_loss=compute_loss1,
+                    )
+                else:
+                    # Validate both models and use the better one for results
+                    results1, maps1, _ = validate.run(
+                        data_dict,
+                        batch_size=batch_size // WORLD_SIZE * 2,
+                        imgsz=imgsz,
+                        half=amp,
+                        model=ema1.ema,
+                        single_cls=single_cls,
+                        dataloader=val_loader,
+                        save_dir=save_dir,
+                        plots=False,
+                        callbacks=callbacks,
+                        compute_loss=compute_loss1,
+                    )
+                    
+                    results2, maps2, _ = validate.run(
+                        data_dict,
+                        batch_size=batch_size // WORLD_SIZE * 2,
+                        imgsz=imgsz,
+                        half=amp,
+                        model=ema2.ema,
+                        single_cls=single_cls,
+                        dataloader=val_loader,
+                        save_dir=save_dir,
+                        plots=False,
+                        callbacks=callbacks,
+                        compute_loss=compute_loss2,
+                    )
+                    
+                    # Compare the fitness of both models and use the better one for results
+                    fi1 = fitness(np.array(results1).reshape(1, -1))
+                    fi2 = fitness(np.array(results2).reshape(1, -1))
+                    
+                    # Convert fitness values to scalar floats for logging
+                    fi1_float = float(fi1.item() if hasattr(fi1, 'item') else fi1)
+                    fi2_float = float(fi2.item() if hasattr(fi2, 'item') else fi2)
+                    
+                    if fi1_float >= fi2_float:
+                        results, maps = results1, maps1
+                        LOGGER.info(f"Model 1 performed better: {fi1_float:.4f} vs {fi2_float:.4f}")
+                    else:
+                        results, maps = results2, maps2
+                        LOGGER.info(f"Model 2 performed better: {fi2_float:.4f} vs {fi1_float:.4f}")
+                    
+                    # Display stochastic co-teaching statistics for this epoch if enabled
+                    if opt.stochastic and hasattr(opt, 'epoch_thresholds1') and len(opt.epoch_thresholds1) > 0:
+                        # Calculate averages
+                        avg_threshold1 = sum(opt.epoch_thresholds1) / len(opt.epoch_thresholds1)
+                        avg_threshold2 = sum(opt.epoch_thresholds2) / len(opt.epoch_thresholds2) 
+                        avg_keep_rate1 = sum(opt.epoch_keep_rates1) / len(opt.epoch_keep_rates1)
+                        avg_keep_rate2 = sum(opt.epoch_keep_rates2) / len(opt.epoch_keep_rates2)
+                        
+                        LOGGER.info(f"\nStochastic co-teaching summary for epoch {epoch}:")
+                        LOGGER.info(f"  Beta distribution: α={opt.stocot_alpha}, β={opt.stocot_beta}")
+                        LOGGER.info(f"  Average thresholds: {avg_threshold1:.3f}/{avg_threshold2:.3f}")
+                        LOGGER.info(f"  Average keep rates: {avg_keep_rate1:.2f}/{avg_keep_rate2:.2f} (equivalent to remember rates)")
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -478,17 +779,36 @@ def train(hyp, opt, device, callbacks):
 
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
-                ckpt = {
-                    "epoch": epoch,
-                    "best_fitness": best_fitness,
-                    "model": deepcopy(de_parallel(model)).half(),
-                    "ema": deepcopy(ema.ema).half(),
-                    "updates": ema.updates,
-                    "optimizer": optimizer.state_dict(),
-                    "opt": vars(opt),
-                    "git": GIT_INFO,  # {remote, branch, commit} if a git repo
-                    "date": datetime.now().isoformat(),
-                }
+                if not opt.coteaching:
+                    # Standard checkpoint saving
+                    ckpt = {
+                        "epoch": epoch,
+                        "best_fitness": best_fitness,
+                        "model": deepcopy(de_parallel(model1)).half(),
+                        "ema": deepcopy(ema1.ema).half(),
+                        "updates": ema1.updates,
+                        "optimizer": optimizer1.state_dict(),
+                        "opt": vars(opt),
+                        "git": GIT_INFO,  # {remote, branch, commit} if a git repo
+                        "date": datetime.now().isoformat(),
+                    }
+                else:
+                    # Save both models when using co-teaching
+                    ckpt = {
+                        "epoch": epoch,
+                        "best_fitness": best_fitness,
+                        "model1": deepcopy(de_parallel(model1)).half(),
+                        "model2": deepcopy(de_parallel(model2)).half(),
+                        "ema1": deepcopy(ema1.ema).half(),
+                        "ema2": deepcopy(ema2.ema).half(),
+                        "updates1": ema1.updates,
+                        "updates2": ema2.updates,
+                        "optimizer1": optimizer1.state_dict(),
+                        "optimizer2": optimizer2.state_dict(),
+                        "opt": vars(opt),
+                        "git": GIT_INFO,
+                        "date": datetime.now().isoformat(),
+                    }
 
                 # Save last, best and delete
                 torch.save(ckpt, last)
@@ -514,14 +834,98 @@ def train(hyp, opt, device, callbacks):
         LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
         for f in last, best:
             if f.exists():
-                strip_optimizer(f)  # strip optimizers
+                try:
+                    # Try normal strip_optimizer for standard case
+                    strip_optimizer(f)  # strip optimizers
+                except KeyError:
+                    # For co-teaching case, load the checkpoint and manually strip it
+                    LOGGER.info(f"Using custom stripping for co-teaching model {f}")
+                    ckpt = torch.load(f, map_location=device)
+                    # For EMA models, the structure might be different depending on YOLOv5 version
+                    # In some versions, ema1/ema2 are the actual models, in others they might have .ema attribute
+                    if 'ema1' in ckpt and ckpt['ema1'] is not None:
+                        if hasattr(ckpt['ema1'], 'ema'):
+                            ckpt['model1'] = ckpt['ema1'].ema  # use EMA model if available
+                        else:
+                            ckpt['model1'] = ckpt['ema1']  # ema1 is already the model
+                    if 'ema2' in ckpt and ckpt['ema2'] is not None:
+                        if hasattr(ckpt['ema2'], 'ema'):
+                            ckpt['model2'] = ckpt['ema2'].ema  # use EMA model if available
+                        else:
+                            ckpt['model2'] = ckpt['ema2']  # ema2 is already the model
+                        
+                    # Remove optimizer and other training components
+                    for k in ['optimizer1', 'optimizer2', 'scheduler1', 'scheduler2', 'best_fitness', 'ema1', 'ema2', 'updates']:
+                        if k in ckpt:
+                            ckpt[k] = None
+                    
+                    # Convert models to half precision
+                    # First ensure the models are properly extracted
+                    if 'model1' not in ckpt:
+                        ckpt['model1'] = model1.float() if model1 is not None else None
+                    if 'model2' not in ckpt:
+                        ckpt['model2'] = model2.float() if model2 is not None else None
+                    
+                    # Now convert to half precision
+                    if 'model1' in ckpt and ckpt['model1'] is not None:
+                        try:
+                            ckpt['model1'].half()
+                            for p in ckpt['model1'].parameters():
+                                p.requires_grad = False
+                        except Exception as e:
+                            LOGGER.warning(f"Could not convert model1 to half precision: {e}")
+                    
+                    if 'model2' in ckpt and ckpt['model2'] is not None:
+                        try:
+                            ckpt['model2'].half()
+                            for p in ckpt['model2'].parameters():
+                                p.requires_grad = False
+                        except Exception as e:
+                            LOGGER.warning(f"Could not convert model2 to half precision: {e}")
+                            
+                    # Save stripped model
+                    torch.save(ckpt, f)
+                    mb = os.path.getsize(f) / 1e6  # filesize
+                    LOGGER.info(f"Co-teaching optimizer stripped from {f}, {mb:.1f}MB")
+                
                 if f is best:
                     LOGGER.info(f"\nValidating {f}...")
+                    # For validation, we'll use model1 from the checkpoint if it's a co-teaching model
+                    if opt.coteaching:
+                        try:
+                            ckpt = torch.load(f, map_location=device)
+                            # Try several possible model formats
+                            if 'model1' in ckpt and ckpt['model1'] is not None:
+                                val_model = ckpt['model1']
+                            elif 'ema1' in ckpt and ckpt['ema1'] is not None:
+                                # EMA might be the model directly or have an .ema attribute
+                                if hasattr(ckpt['ema1'], 'ema'):
+                                    val_model = ckpt['ema1'].ema
+                                else:
+                                    val_model = ckpt['ema1']
+                            elif 'model' in ckpt:
+                                val_model = ckpt['model']
+                            else:
+                                # If all else fails, use model1 from memory
+                                LOGGER.warning(f"Could not find model in checkpoint, using current model1")
+                                val_model = model1
+                                
+                            # Convert to half precision if possible
+                            try:
+                                val_model = val_model.half()
+                            except Exception as e:
+                                LOGGER.warning(f"Could not convert validation model to half precision: {e}")
+                        except Exception as e:
+                            LOGGER.warning(f"Error loading validation model: {e}, using current model1")
+                            val_model = model1.half()
+                    else:
+                        val_model = attempt_load(f, device).half()
+                        
                     results, _, _ = validate.run(
                         data_dict,
                         batch_size=batch_size // WORLD_SIZE * 2,
                         imgsz=imgsz,
-                        model=attempt_load(f, device).half(),
+                        model=val_model,
                         iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
                         single_cls=single_cls,
                         dataloader=val_loader,
@@ -569,7 +973,7 @@ def parse_opt(known=False):
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
-    parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
+    parser.add_argument("--batch-size", type=int, default=8, help="total batch size for all GPUs, -1 for autobatch")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
     parser.add_argument("--rect", action="store_true", help="rectangular training")
     parser.add_argument("--resume", nargs="?", const=True, default=False, help="resume most recent training")
@@ -577,6 +981,15 @@ def parse_opt(known=False):
     parser.add_argument("--noval", action="store_true", help="only validate final epoch")
     parser.add_argument("--noautoanchor", action="store_true", help="disable AutoAnchor")
     parser.add_argument("--noplots", action="store_true", help="save no plot files")
+    # Co-teaching parameters
+    parser.add_argument("--coteaching", action="store_true", help="enable co-teaching algorithm")
+    parser.add_argument("--stochastic", action="store_true", help="use stochastic co-teaching (doesn't require known noise rate)")
+    parser.add_argument("--forget-rate", type=float, default=0.2, help="initial forget rate for co-teaching")
+    parser.add_argument("--num-gradual", type=int, default=100, help="number of epochs for gradual increase of forget rate")
+    parser.add_argument("--init-noise", type=float, default=0.005, help="noise factor for initializing the second model (lower values = more similar models)")
+    parser.add_argument("--stocot-alpha", type=float, default=32, help="alpha parameter for beta distribution in stochastic co-teaching")
+    parser.add_argument("--stocot-beta", type=float, default=2, help="beta parameter for beta distribution in stochastic co-teaching")
+    
     parser.add_argument("--evolve", type=int, nargs="?", const=300, help="evolve hyperparameters for x generations")
     parser.add_argument(
         "--evolve_population", type=str, default=ROOT / "data/hyps", help="location for loading population"

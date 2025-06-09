@@ -137,18 +137,25 @@ class ComputeLoss:
         self.device = device
 
     def __call__(self, p, targets):  # predictions, targets
-        """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
+        """Performs forward pass, calculating class, box, and object loss for given predictions and targets.
+        Returns total loss, individual loss components, per-image losses and sorted indices for co-teaching.
+        """
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        
+        # For co-teaching: track per-image losses
+        bs = p[0].shape[0]  # batch size
+        per_img_loss = torch.zeros(bs, device=self.device)  # loss per image in batch
+        img_indices = torch.arange(bs, device=self.device)  # image indices
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
             tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
 
-            if n := b.shape[0]:
+            if n := b.shape[0]:  # number of targets
                 # pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
                 pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
 
@@ -158,6 +165,15 @@ class ComputeLoss:
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
                 lbox += (1.0 - iou).mean()  # iou loss
+                
+                # Track per-image box loss for co-teaching
+                if n > 0:
+                    img_box_loss = (1.0 - iou) * self.hyp["box"]
+                    # Calculate mean box loss per image
+                    for idx in range(bs):
+                        img_mask = (b == idx)
+                        if img_mask.any():
+                            per_img_loss[idx] += img_box_loss[img_mask].mean()
 
                 # Objectness
                 iou = iou.detach().clamp(0).type(tobj.dtype)
@@ -172,10 +188,25 @@ class ComputeLoss:
                 if self.nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(pcls, self.cn, device=self.device)  # targets
                     t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(pcls, t)  # BCE
+                    cls_loss = self.BCEcls(pcls, t)  # BCE
+                    lcls += cls_loss
+                    
+                    # Track per-image classification loss for co-teaching
+                    if n > 0:
+                        cls_loss_per_target = cls_loss * self.hyp["cls"]
+                        for idx in range(bs):
+                            img_mask = (b == idx)
+                            if img_mask.any():
+                                per_img_loss[idx] += cls_loss_per_target.mean() if cls_loss_per_target.dim() == 0 else cls_loss_per_target[img_mask].mean()
 
             obji = self.BCEobj(pi[..., 4], tobj)
-            lobj += obji * self.balance[i]  # obj loss
+            obj_loss = obji * self.balance[i]
+            lobj += obj_loss  # obj loss
+            
+            # Track per-image objectness loss for co-teaching
+            for idx in range(bs):
+                per_img_loss[idx] += self.BCEobj(pi[idx, ..., 4], tobj[idx]).mean() * self.balance[i] * self.hyp["obj"]
+            
             if self.autobalance:
                 self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
 
@@ -184,9 +215,14 @@ class ComputeLoss:
         lbox *= self.hyp["box"]
         lobj *= self.hyp["obj"]
         lcls *= self.hyp["cls"]
-        bs = tobj.shape[0]  # batch size
 
-        return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
+        # Get loss per image and sort for co-teaching
+        sorted_loss, sorted_indices = torch.sort(per_img_loss)
+        
+        # Total loss
+        loss = (lbox + lobj + lcls) * bs
+        
+        return loss, torch.cat((lbox, lobj, lcls)).detach(), per_img_loss, sorted_indices
 
     def build_targets(self, p, targets):
         """Prepares model targets from input targets (image,class,x,y,w,h) for loss computation, returning class, box,

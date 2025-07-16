@@ -1,0 +1,14 @@
+path: ../datasets/acdc # Give path of the dataset 
+train: images/train # Give relative path of the train images
+val: images/val # Give relative path of the validation images
+
+nc: 8
+names: 
+    0: 'pedestrian'
+    1: 'rider'
+    2: 'car'
+    3: 'truck'
+    4: 'bus'
+    5: 'train'
+    6: 'motorcycle'
+    7: 'bicycle'

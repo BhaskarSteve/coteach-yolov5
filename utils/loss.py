@@ -252,3 +252,131 @@ class ComputeLoss:
             tcls.append(c)  # class
 
         return tcls, tbox, indices, anch
+
+
+class ComputeLossCoTeaching(ComputeLoss):
+    """Extension of ComputeLoss that can (1) return per-anchor selection losses (box + λ_cls * cls) and
+    (2) optionally apply a boolean mask indicating which positive anchors should contribute to the loss
+    (the anchors corresponding to *False* entries are ignored).  This is needed for the co-teaching
+    algorithm where each model decides which anchors the peer model should keep for optimisation."""
+
+    def __call__(
+        self,
+        p,
+        targets,
+        masks=None,  # list[Tensor] | None. One boolean mask per detection layer over positive anchors order.
+        return_selection: bool = False,
+    ):
+        """See base class for param description.
+
+        Args:
+            p (list[Tensor]): Model predictions.
+            targets (Tensor): (n_targets, 6) tensor with (image,class,x,y,w,h) in normalised coords.
+            masks (list[Tensor] | None): If given, *len(masks) == model.nl* and each entry is a 1-D boolean
+                Tensor the same length as the positive-anchor list produced for that layer by build_targets().
+                A value of *True* keeps the anchor, *False* discards it (treated as though it were not a
+                positive anchor for this forward pass).
+            return_selection (bool): If *True* the function additionally returns the per-anchor selection losses
+                (un-masked) so the caller can rank anchors; gradients are **not** propagated through the
+                selection losses by default.
+        Returns:
+            tuple: (total_loss, loss_items, selection_losses_per_layer?)
+        """
+        if masks is not None:
+            assert len(masks) == self.nl, "mask list length must match number of detection layers"
+
+        lcls = torch.zeros(1, device=self.device)  # class loss
+        lbox = torch.zeros(1, device=self.device)  # box loss
+        lobj = torch.zeros(1, device=self.device)  # object loss
+        tcls, tbox, indices, anchors = self.build_targets(p, targets)
+
+        layer_anchor_counters = []  # number of positive anchors per layer – useful for caller
+
+        # Initialize selection losses for all layers (even if some have no positive anchors)
+        if return_selection:
+            sel_losses = [torch.tensor([], device=self.device) for _ in range(self.nl)]
+
+        for layer_idx, pi in enumerate(p):  # layer index, layer predictions
+            b, a, gj, gi = indices[layer_idx]  # image, anchor, gridy, gridx
+            tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
+
+            n = b.shape[0]  # number of positive anchors for this layer
+            layer_anchor_counters.append(n)
+            if n:
+                # per-anchor mask handling
+                if masks is not None and masks[layer_idx] is not None:
+                    keep_mask = masks[layer_idx].to(self.device)
+                    # ensure dimensions agree
+                    if keep_mask.numel() != n:
+                        raise ValueError(
+                            f"Mask length for layer {layer_idx} ({keep_mask.numel()}) "
+                            f"does not match positive anchors ({n})."
+                        )
+                else:
+                    keep_mask = torch.ones(n, dtype=torch.bool, device=self.device)
+
+                # predictions for the selected anchors (all first – mask applied later)
+                pxy, pwh, pobj, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)
+
+                pxy = pxy.sigmoid() * 2 - 0.5
+                pwh = (pwh.sigmoid() * 2) ** 2 * anchors[layer_idx]
+                pbox = torch.cat((pxy, pwh), 1)  # predicted box (in grid coords)
+                iou = bbox_iou(pbox, tbox[layer_idx], CIoU=True).squeeze(1)  # (n,)
+
+                # selection loss (computed on *all* anchors – before masking) if requested
+                if return_selection:
+                    with torch.no_grad():
+                        # regression component
+                        reg_loss = 1.0 - iou.detach()  # (n,)
+                        # classification component
+                        t = torch.full_like(pcls, self.cn, device=self.device)
+                        t[range(n), tcls[layer_idx]] = self.cp
+                        cls_per_anchor = (
+                            torch.nn.functional.binary_cross_entropy_with_logits(
+                                pcls, t, reduction="none"
+                            ).mean(dim=1)
+                        )  # (n,)
+                        sel_loss_layer = reg_loss + self.hyp["cls"] * cls_per_anchor
+                        sel_losses[layer_idx] = sel_loss_layer.detach()
+
+                # Apply mask to retain only the kept anchors for loss computation
+                if keep_mask.any():
+                    # regression loss – IoU
+                    kept_iou = iou[keep_mask]
+                    lbox += (1.0 - kept_iou).mean()
+
+                    # objectness target is IoU of kept anchors (optionally scaled by gr)
+                    iou_detached = kept_iou.detach().clamp(0).type(tobj.dtype)
+                    if self.gr < 1:
+                        iou_detached = (1.0 - self.gr) + self.gr * iou_detached
+                    # update tobj only for kept anchors
+                    tobj[b[keep_mask], a[keep_mask], gj[keep_mask], gi[keep_mask]] = iou_detached
+
+                    # classification loss (if multi-class)
+                    if self.nc > 1:
+                        t = torch.full_like(pcls[keep_mask], self.cn, device=self.device)
+                        t[range(kept_iou.numel()), tcls[layer_idx][keep_mask]] = self.cp
+                        lcls += self.BCEcls(pcls[keep_mask], t)
+                #­­ else: no kept anchors – skip adding losses
+
+            # objectness loss over entire grid (including background)
+            obji = self.BCEobj(pi[..., 4], tobj)
+            lobj += obji * self.balance[layer_idx]
+            if self.autobalance:
+                self.balance[layer_idx] = (
+                    self.balance[layer_idx] * 0.9999 + 0.0001 / obji.detach().item()
+                )
+
+        if self.autobalance:
+            self.balance = [x / self.balance[self.ssi] for x in self.balance]
+        lbox *= self.hyp["box"]
+        lobj *= self.hyp["obj"]
+        lcls *= self.hyp["cls"]
+        bs = targets.shape[0] if targets.numel() else 0  # batch size – fall back to 0 if no targets
+        total_loss = (lbox + lobj + lcls) * bs
+        loss_items = torch.cat((lbox, lobj, lcls)).detach()
+
+        if return_selection:
+            return total_loss, loss_items, sel_losses  # list per layer
+        else:
+            return total_loss, loss_items

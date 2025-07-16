@@ -223,14 +223,39 @@ def train(hyp, opt, device, callbacks):
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
 
+    # ------------------------------------------------------------------------------------
+    # Co-teaching: build a second model (gϕ) with the same architecture
+    # ------------------------------------------------------------------------------------
+    coteach = opt.noise_rate > 0  # enable when a positive noise rate is provided
+    if coteach:
+        # Build model_g exactly the same way as model (can share weights if pretrained)
+        if pretrained:
+            # Clone pretrained weights and apply small noise for diversity
+            model_g = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
+            model_g.load_state_dict(csd, strict=False)
+            # perturb weights by Gaussian noise
+            for p in model_g.parameters():
+                p.data += torch.randn_like(p.data) * opt.init_noise
+        else:
+            model_g = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
+
+        amp_g = check_amp(model_g)
+        # actual layer freezing will be applied after the pattern is computed below
+    else:
+        model_g, amp_g = None, None
+
     # Freeze
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
-    for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
-        # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-        if any(x in k for x in freeze):
-            LOGGER.info(f"freezing {k}")
-            v.requires_grad = False
+    def apply_freeze(mdl):
+        for k_, v_ in mdl.named_parameters():
+            v_.requires_grad = True
+            if any(x in k_ for x in freeze):
+                LOGGER.info(f"freezing {k_}")
+                v_.requires_grad = False
+
+    apply_freeze(model)
+    if coteach:
+        apply_freeze(model_g)
 
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
@@ -247,6 +272,9 @@ def train(hyp, opt, device, callbacks):
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
     optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
 
+    if coteach:
+        optimizer_g = smart_optimizer(model_g, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+
     # Scheduler
     if opt.cos_lr:
         lf = one_cycle(1, hyp["lrf"], epochs)  # cosine 1->hyp['lrf']
@@ -258,8 +286,15 @@ def train(hyp, opt, device, callbacks):
 
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
+    if coteach:
+        scheduler_g = lr_scheduler.LambdaLR(optimizer_g, lr_lambda=lf)
+
     # EMA
     ema = ModelEMA(model) if RANK in {-1, 0} else None
+    if coteach:
+        ema_g = ModelEMA(model_g) if RANK in {-1, 0} else None
+    else:
+        ema_g = None
 
     # Resume
     best_fitness, start_epoch = 0.0, 0
@@ -343,6 +378,14 @@ def train(hyp, opt, device, callbacks):
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
+    # Co-teaching: replicate model attributes to model_g so loss computation works
+    if coteach:
+        model_g.nc = nc
+        model_g.hyp = hyp
+        # reuse class weights and names from model
+        model_g.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
+        model_g.names = names
+
     # Start training
     t0 = time.time()
     nb = len(train_loader)  # number of batches
@@ -353,8 +396,21 @@ def train(hyp, opt, device, callbacks):
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.amp.GradScaler('cuda', enabled=amp)
-    stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
+    if coteach:
+        scaler_g = torch.amp.GradScaler('cuda', enabled=amp_g)
+    else:
+        scaler_g = None
+    if coteach:
+        stopper_f, stopper_g = EarlyStopping(patience=opt.patience), EarlyStopping(patience=opt.patience)
+    else:
+        stopper = EarlyStopping(patience=opt.patience)
+    stop = False
+    if coteach:
+        from utils.loss import ComputeLossCoTeaching
+        compute_loss_f = ComputeLossCoTeaching(model)
+        compute_loss_g = ComputeLossCoTeaching(model_g)
+    else:
+        compute_loss = ComputeLoss(model)
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\n"
@@ -363,6 +419,10 @@ def train(hyp, opt, device, callbacks):
         f"Starting training for {epochs} epochs..."
     )
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        # initialize co-teaching box counters
+        if coteach:
+            epoch_total_boxes = 0
+            epoch_removed_boxes = 0
         callbacks.run("on_train_epoch_start")
         model.train()
 
@@ -408,27 +468,140 @@ def train(hyp, opt, device, callbacks):
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
-            # Forward
-            with torch.amp.autocast('cuda', enabled=amp):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                if opt.quad:
-                    loss *= 4.0
+            # -------------------------------------------------------------------------
+            # Forward + Co-teaching filtering
+            # -------------------------------------------------------------------------
+            if coteach:
+                with torch.amp.autocast('cuda', enabled=amp):
+                    pred_f = model(imgs)
+                with torch.amp.autocast('cuda', enabled=amp_g):
+                    pred_g = model_g(imgs)
 
-            # Backward
-            scaler.scale(loss).backward()
+                # ------------------------------------------------------------------
+                # 1. Compute selection losses (no gradients)
+                # ------------------------------------------------------------------
+                with torch.no_grad():
+                    _, _, sel_f_layers = compute_loss_f(
+                        pred_f, targets.to(device), return_selection=True
+                    )
+                    _, _, sel_g_layers = compute_loss_g(
+                        pred_g, targets.to(device), return_selection=True
+                    )
+
+                # Flatten selection losses to build masks
+                all_sel_f = torch.cat(sel_f_layers) if sel_f_layers else torch.tensor([], device=device)
+                all_sel_g = torch.cat(sel_g_layers) if sel_g_layers else torch.tensor([], device=device)
+
+                n_pos = all_sel_f.numel()
+                # track total and removed boxes for co-teaching statistics
+                epoch_total_boxes += n_pos
+                if n_pos == 0:
+                    # No positive anchors in this batch – fall back to normal training
+                    masks_f_layers = None
+                    masks_g_layers = None
+                else:
+                    r_e = opt.noise_rate * min(epoch / max(opt.warmup_epochs, 1), 1.0)
+                    k_keep = max(1, int(math.ceil((1.0 - r_e) * n_pos)))
+                    epoch_removed_boxes += (n_pos - k_keep)
+
+                    idx_keep_f = torch.topk(all_sel_g, k_keep, largest=False).indices  # g selects for f
+                    idx_keep_g = torch.topk(all_sel_f, k_keep, largest=False).indices  # f selects for g
+
+                    # Build boolean masks split per layer
+                    # Ensure we have exactly nl layers even if some have no positive anchors
+                    nl = de_parallel(model).model[-1].nl  # number of detection layers
+                    masks_f_layers, masks_g_layers = [], []
+                    
+                    # If we have selection losses, they should match the number of detection layers
+                    if len(sel_f_layers) == nl:
+                        start = 0
+                        for l_sel_f, l_sel_g in zip(sel_f_layers, sel_g_layers):
+                            l_len = l_sel_f.numel()
+                            end = start + l_len
+                            mask_f = torch.zeros(l_len, dtype=torch.bool, device=device)
+                            mask_g = torch.zeros(l_len, dtype=torch.bool, device=device)
+                            # assign indices that fall within this layer slice
+                            if n_pos:
+                                sel = idx_keep_f[(idx_keep_f >= start) & (idx_keep_f < end)] - start
+                                mask_f[sel] = True
+                                sel2 = idx_keep_g[(idx_keep_g >= start) & (idx_keep_g < end)] - start
+                                mask_g[sel2] = True
+                            masks_f_layers.append(mask_f)
+                            masks_g_layers.append(mask_g)
+                            start = end
+                    else:
+                        # If mismatch, create empty masks for all layers
+                        for _ in range(nl):
+                            masks_f_layers.append(torch.zeros(0, dtype=torch.bool, device=device))
+                            masks_g_layers.append(torch.zeros(0, dtype=torch.bool, device=device))
+
+                # ------------------------------------------------------------------
+                # 2. Compute masked losses WITH gradients
+                # ------------------------------------------------------------------
+                with torch.amp.autocast('cuda', enabled=amp):
+                    loss_f, loss_items_f = compute_loss_f(
+                        pred_f, targets.to(device), masks=masks_f_layers, return_selection=False
+                    )
+                with torch.amp.autocast('cuda', enabled=amp_g):
+                    loss_g, loss_items_g = compute_loss_g(
+                        pred_g, targets.to(device), masks=masks_g_layers, return_selection=False
+                    )
+
+                if RANK != -1:
+                    loss_f *= WORLD_SIZE
+                    loss_g *= WORLD_SIZE
+
+                if opt.quad:
+                    loss_f *= 4.0
+                    loss_g *= 4.0
+
+                # Backward for both models
+                scaler.scale(loss_f).backward()
+                scaler_g.scale(loss_g).backward()
+                # For logging purpose, average the two models' loss components
+                loss_items = (loss_items_f + loss_items_g) / 2.0
+            else:
+                # Standard single-model forward/backward
+                with torch.amp.autocast('cuda', enabled=amp):
+                    pred = model(imgs)  # forward
+                    loss, loss_items = compute_loss(pred, targets.to(device))
+                    if RANK != -1:
+                        loss *= WORLD_SIZE
+                    if opt.quad:
+                        loss *= 4.0
+
+                scaler.scale(loss).backward()
+                loss_items = loss_items  # keep same variable name for consistency
 
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
-                scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
+                if coteach:
+                    # --- model f ---
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+
+                    # --- model g ---
+                    scaler_g.unscale_(optimizer_g)
+                    torch.nn.utils.clip_grad_norm_(model_g.parameters(), max_norm=10.0)
+                    scaler_g.step(optimizer_g)
+                    scaler_g.update()
+                    optimizer_g.zero_grad()
+
+                    if ema:
+                        ema.update(model)
+                    if coteach and ema_g:
+                        ema_g.update(model_g)
+                else:
+                    scaler.unscale_(optimizer)  # unscale gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+                    scaler.step(optimizer)  # optimizer.step
+                    scaler.update()
+                    optimizer.zero_grad()
+                    if ema:
+                        ema.update(model)
                 last_opt_step = ni
 
             # Log
@@ -447,12 +620,21 @@ def train(hyp, opt, device, callbacks):
         # Scheduler
         lr = [x["lr"] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
+        if coteach:
+            scheduler_g.step()
 
         if RANK in {-1, 0}:
             # mAP
             callbacks.run("on_train_epoch_end", epoch=epoch)
+            # Co-teaching stats
+            if coteach:
+                r_e = opt.noise_rate * min(epoch / max(opt.warmup_epochs, 1), 1.0)
+                LOGGER.info(f"Epoch {epoch}: total_boxes={epoch_total_boxes}, removed_boxes={epoch_removed_boxes}, forget_rate={r_e:.3f}")
             ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
-            final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
+            if coteach:
+                final_epoch = (epoch + 1 == epochs) or (stopper_f.possible_stop and stopper_g.possible_stop)
+            else:
+                final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
                 results, maps, _ = validate.run(
                     data_dict,
@@ -465,12 +647,33 @@ def train(hyp, opt, device, callbacks):
                     save_dir=save_dir,
                     plots=False,
                     callbacks=callbacks,
-                    compute_loss=compute_loss,
+                    compute_loss=compute_loss_f if coteach else compute_loss,
                 )
+
+                if coteach:
+                    results_g, maps_g, _ = validate.run(
+                        data_dict,
+                        batch_size=batch_size // WORLD_SIZE * 2,
+                        imgsz=imgsz,
+                        half=amp_g,
+                        model=ema_g.ema,
+                        single_cls=single_cls,
+                        dataloader=val_loader,
+                        save_dir=save_dir,
+                        plots=False,
+                        callbacks=callbacks,
+                        compute_loss=compute_loss_g,
+                    )
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-            stop = stopper(epoch=epoch, fitness=fi)  # early stop check
+            if coteach:
+                fi_g = fitness(np.array(results_g).reshape(1, -1))
+                stop_f_epoch = stopper_f(epoch=epoch, fitness=fi)
+                stop_g_epoch = stopper_g(epoch=epoch, fitness=fi_g)
+                stop = stop_f_epoch and stop_g_epoch
+            else:
+                stop = stopper(epoch=epoch, fitness=fi)
             if fi > best_fitness:
                 best_fitness = fi
             log_vals = list(mloss) + list(results) + lr
@@ -530,7 +733,7 @@ def train(hyp, opt, device, callbacks):
                         verbose=True,
                         plots=plots,
                         callbacks=callbacks,
-                        compute_loss=compute_loss,
+                        compute_loss=compute_loss_f if coteach else compute_loss,
                     )  # val best model with plots
                     if is_coco:
                         callbacks.run("on_fit_epoch_end", list(mloss) + list(results) + lr, epoch, best_fitness, fi)
@@ -566,7 +769,7 @@ def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=ROOT / "", help="initial weights path")
     parser.add_argument("--cfg", type=str, default="yolov5m.yaml", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "data/kitti.yaml", help="dataset.yaml path")
+    parser.add_argument("--data", type=str, default=ROOT / "data/bdd.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
@@ -591,7 +794,7 @@ def parse_opt(known=False):
     parser.add_argument("--optimizer", type=str, choices=["SGD", "Adam", "AdamW"], default="SGD", help="optimizer")
     parser.add_argument("--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode")
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
-    parser.add_argument("--project", default=ROOT / "runs/train", help="save to project/name")
+    parser.add_argument("--project", default=ROOT / "runs/bdd", help="save to project/name")
     parser.add_argument("--name", default="exp", help="save to project/name")
     parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
     parser.add_argument("--quad", action="store_true", help="quad dataloader")
@@ -612,6 +815,11 @@ def parse_opt(known=False):
     # NDJSON logging
     parser.add_argument("--ndjson-console", action="store_true", help="Log ndjson to console")
     parser.add_argument("--ndjson-file", action="store_true", help="Log ndjson to file")
+
+    # Co-teaching specific hyperparameters
+    parser.add_argument("--noise_rate", type=float, default=0.2, help="Estimated noise rate in the labels (0-1)")
+    parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of initial epochs for linear forget-rate warmup")
+    parser.add_argument("--init_noise", type=float, default=0.0, help="Std dev of Gaussian noise to add to pretrained model copy")
 
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
